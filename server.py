@@ -1,56 +1,70 @@
-from fastapi import FastAPI, HTTPException, Body
-from fastapi.responses import Response
-import os
-import json
-import zipfile
+from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 import uuid
+import os
+import requests
+import zipfile
 
 app = FastAPI()
 
+# Public files directory
+FILES_ROOT = "/app/vlm_files"
+os.makedirs(FILES_ROOT, exist_ok=True)
+
+app.mount("/vlm_files", StaticFiles(directory=FILES_ROOT), name="vlm_files")
+
+DOWNLOAD_TIMEOUT = 60
+CHUNK_SIZE = 1024 * 1024
+
+
+@app.get("/")
+def health():
+    return {"status": "prepare_vlm_ok"}
+
+
 @app.post("/prepare_vlm")
-def prepare_vlm(payload: dict = Body(...)):
-    """
-    Expected payload from /run:
+def prepare_vlm(frame_urls: list[str]):
+    job_id = str(uuid.uuid4())
+    job_dir = os.path.join(FILES_ROOT, job_id)
+    os.makedirs(job_dir, exist_ok=True)
 
-    {
-      "job_id": "...",
-      "frame_paths": ["/tmp/xxx/early/scene_001.jpg", ...]
+    local_files = []
+
+    # ---------------------------
+    # 1️⃣ Download Each Frame
+    # ---------------------------
+    for i, url in enumerate(frame_urls):
+        filename = f"frame_{i+1:03d}.jpg"
+        local_path = os.path.join(job_dir, filename)
+
+        full_url = "https://videoserver-production.up.railway.app" + url
+
+        try:
+            with requests.get(full_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+                r.raise_for_status()
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                        if chunk:
+                            f.write(chunk)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to download frame: {full_url} | {e}"
+            )
+
+        local_files.append(local_path)
+
+    # ---------------------------
+    # 2️⃣ Zip for VLM Upload
+    # ---------------------------
+    zip_path = os.path.join(FILES_ROOT, f"{job_id}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+        for f in local_files:
+            zipf.write(f, os.path.basename(f))
+
+    return {
+        "job_id": job_id,
+        "total_files": len(local_files),
+        "image_files": local_files,   # ✅ Direct VLM Array[File]
+        "zip_file": f"/vlm_files/{job_id}.zip"
     }
-    """
-
-    job_id = payload.get("job_id")
-    frame_paths = payload.get("frame_paths")
-
-    if not job_id or not frame_paths:
-        raise HTTPException(status_code=400, detail="Missing job_id or frame_paths")
-
-    # Verify all files exist
-    missing = [p for p in frame_paths if not os.path.exists(p)]
-    if missing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Missing frame files: {missing}"
-        )
-
-    # Create a temporary zip to return as files
-    zip_name = f"{job_id}_vlm_frames.zip"
-    zip_path = f"/tmp/{zip_name}"
-
-    with zipfile.ZipFile(zip_path, "w") as zipf:
-        for path in frame_paths:
-            arcname = os.path.basename(path)
-            zipf.write(path, arcname)
-
-    # Return ZIP as binary file (Dify will receive it as File)
-    with open(zip_path, "rb") as f:
-        data = f.read()
-
-    headers = {
-        "Content-Disposition": f'attachment; filename="{zip_name}"'
-    }
-
-    return Response(
-        content=data,
-        media_type="application/zip",
-        headers=headers
-    )
