@@ -1,70 +1,62 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-import uuid
 import os
-import requests
+import uuid
 import zipfile
+import requests
 
 app = FastAPI()
 
-# Public files directory
-FILES_ROOT = "/app/vlm_files"
-os.makedirs(FILES_ROOT, exist_ok=True)
+VLM_ROOT = "/app/vlm_files"
+os.makedirs(VLM_ROOT, exist_ok=True)
 
-app.mount("/vlm_files", StaticFiles(directory=FILES_ROOT), name="vlm_files")
-
-DOWNLOAD_TIMEOUT = 60
-CHUNK_SIZE = 1024 * 1024
-
-
-@app.get("/")
-def health():
-    return {"status": "prepare_vlm_ok"}
+app.mount("/vlm_files", StaticFiles(directory=VLM_ROOT), name="vlm_files")
 
 
 @app.post("/prepare_vlm")
-def prepare_vlm(frame_urls: list[str]):
+def prepare_vlm(payload: dict):
+
+    if "frame_urls" not in payload:
+        raise HTTPException(400, "Missing frame_urls list")
+
+    frame_urls = payload["frame_urls"]
+
+    if not isinstance(frame_urls, list):
+        raise HTTPException(400, "frame_urls must be a list")
+
     job_id = str(uuid.uuid4())
-    job_dir = os.path.join(FILES_ROOT, job_id)
+    job_dir = os.path.join(VLM_ROOT, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    local_files = []
+    image_files = []
 
-    # ---------------------------
-    # 1️⃣ Download Each Frame
-    # ---------------------------
-    for i, url in enumerate(frame_urls):
-        filename = f"frame_{i+1:03d}.jpg"
-        local_path = os.path.join(job_dir, filename)
-
-        full_url = "https://videoserver-production.up.railway.app" + url
+    for idx, url in enumerate(frame_urls, start=1):
+        filename = f"frame_{idx:03d}.jpg"
+        path = os.path.join(job_dir, filename)
 
         try:
-            with requests.get(full_url, stream=True, timeout=DOWNLOAD_TIMEOUT) as r:
+            with requests.get(url, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                with open(local_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
-                        if chunk:
-                            f.write(chunk)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Failed to download frame: {full_url} | {e}"
-            )
+                with open(path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=512 * 1024):
+                        f.write(chunk)
+        except Exception:
+            raise HTTPException(400, f"Failed to fetch frame: {url}")
 
-        local_files.append(local_path)
+        image_files.append(path)
 
     # ---------------------------
-    # 2️⃣ Zip for VLM Upload
+    # ZIP images
     # ---------------------------
-    zip_path = os.path.join(FILES_ROOT, f"{job_id}.zip")
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-        for f in local_files:
-            zipf.write(f, os.path.basename(f))
+    zip_path = os.path.join(VLM_ROOT, f"{job_id}.zip")
+
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for f in image_files:
+            zipf.write(f, arcname=os.path.basename(f))
 
     return {
         "job_id": job_id,
-        "total_files": len(local_files),
-        "image_files": local_files,   # ✅ Direct VLM Array[File]
+        "total_files": len(image_files),
+        "image_files": image_files,      # ✅ THIS is Array[File] for VLM
         "zip_file": f"/vlm_files/{job_id}.zip"
     }
